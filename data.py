@@ -23,6 +23,16 @@ from pathlib import Path
 import pandas as pd
 import nfl_data_py as nfl
 
+# nflreadpy column names differ from nfl_data_py in two places.
+# We rename on import so the rest of the pipeline sees a consistent schema.
+_NFLREADPY_RENAME: dict[str, str] = {
+    "team":                  "recent_team",
+    "passing_interceptions": "interceptions",
+}
+
+# nfl_data_py is available through 2024; nflreadpy covers 2025 onward.
+_NFl_DATA_PY_MAX_YEAR: int = 2024
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -187,6 +197,27 @@ def _validate_ppr_score(df: pd.DataFrame, tolerance: float = 2.0, max_bad_pct: f
 # ---------------------------------------------------------------------------
 
 
+def _pull_year_nflreadpy(year: int) -> pd.DataFrame:
+    """Pull one season of weekly stats via nflreadpy (for 2025+).
+
+    nflreadpy returns a Polars DataFrame with two column names that differ
+    from the nfl_data_py schema we use everywhere else:
+        ``team``                  → ``recent_team``
+        ``passing_interceptions`` → ``interceptions``
+
+    We rename those here and then apply the same PPR scoring and validation
+    pipeline as the nfl_data_py path, so callers see a uniform schema.
+    """
+    import nflreadpy as nflr
+
+    raw_pl = nflr.load_player_stats(seasons=year, summary_level="week")
+    raw = raw_pl.rename(_NFLREADPY_RENAME).to_pandas()
+
+    raw["ppr_score"] = _compute_ppr_score(raw)
+    _validate_ppr_score(raw)
+    return raw[[c for c in _KEEP_COLS if c in raw.columns]].copy()
+
+
 def pull_weekly_stats(
     years: list[int],
     season_type: str = "REG",
@@ -249,11 +280,14 @@ def pull_weekly_stats(
         cache_path = DATA_DIR / f"weekly_stats_{year}.parquet"
         if not force_refresh and cache_path.exists():
             df = pd.read_parquet(cache_path)
-        else:
+        elif year <= _NFl_DATA_PY_MAX_YEAR:
             raw = nfl.import_weekly_data([year])
             raw["ppr_score"] = _compute_ppr_score(raw)
             _validate_ppr_score(raw)
             df = raw[[c for c in _KEEP_COLS if c in raw.columns]].copy()
+            df.to_parquet(cache_path, index=False)
+        else:
+            df = _pull_year_nflreadpy(year)
             df.to_parquet(cache_path, index=False)
 
         frames.append(df)
