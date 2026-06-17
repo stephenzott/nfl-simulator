@@ -28,7 +28,8 @@ Parameters are estimated via **method of moments** on non-zero weeks only:
 ```
 β̂ = σ̂² / μ̂        (scale)
 α̂ = μ̂² / σ̂²       (shape)
-π̂ = (zero-score weeks) / (total weeks)
+π̂ = (n_possible − n_nonzero) / n_possible
+    where n_possible = 17 × n_seasons  (bye weeks excluded)
 ```
 
 ### Simulation Step (one trial)
@@ -60,38 +61,52 @@ Recommended N = 10,000. At p̂ = 0.6, SE ≈ ±0.005.
 
 ```python
 PPR_SCORING = {
-    "passing_yards":    0.04,   # per yard
-    "passing_tds":      4.0,
-    "interceptions":   -2.0,
-    "rushing_yards":    0.1,    # per yard
-    "rushing_tds":      6.0,
-    "receiving_yards":  0.1,    # per yard
-    "receiving_tds":    6.0,
-    "receptions":       1.0,    # full PPR
-    "fumbles_lost":    -2.0,
+    "passing_yards":      0.04,   # per yard
+    "passing_tds":        4.0,
+    "interceptions":     -2.0,
+    "rushing_yards":      0.1,    # per yard
+    "rushing_tds":        6.0,
+    "receiving_yards":    0.1,    # per yard
+    "receiving_tds":      6.0,
+    "receptions":         1.0,    # full PPR
+    "fumbles_lost":      -2.0,
     "two_pt_conversions": 2.0,
 }
 ```
 
 ---
 
-## Data Source
+## Data Sources
 
-**nfl_data_py** (wraps nflfastR — no API key required)
+Two libraries are used depending on the season year. Both require no API key.
 
 ```bash
-pip install nfl_data_py pandas numpy scipy
+pip install nfl_data_py nflreadpy pandas numpy scipy matplotlib
 ```
 
-Primary tables used:
+### nfl_data_py — seasons 2022–2024
 
-| Table | nfl_data_py call | Purpose |
+| Table | Call | Purpose |
 |---|---|---|
 | Weekly player stats | `nfl.import_weekly_data([year])` | Fit α, β, π per player |
-| Season rosters | `nfl.import_rosters([year])` | Map players to teams |
+| Season rosters | `nfl.import_seasonal_rosters([year])` | Map players to teams |
 | Schedule | `nfl.import_schedules([year])` | Week-by-week matchups |
 
-Historical range: **2022–2024** (3 seasons for stable parameter estimates).
+### nflreadpy — seasons 2025+
+
+`data.py` dispatches to `nflreadpy.load_player_stats(seasons=year)` for any
+year > 2024 and normalizes two column name differences before applying the same
+PPR scoring pipeline:
+
+| nflreadpy column | nfl_data_py equivalent |
+|---|---|
+| `passing_interceptions` | `interceptions` |
+| `team` | `recent_team` |
+
+### Historical range
+
+**2022–2025** (4 seasons) for parameter estimation; production parameters are
+written to `data/player_params.parquet` after running `exploration.ipynb`.
 2026 preseason projections can override μ̂ while keeping historical σ̂².
 
 ---
@@ -99,22 +114,23 @@ Historical range: **2022–2024** (3 seasons for stable parameter estimates).
 ## File Structure
 
 ```
-nfl_mc_simulator/
+nfl-simulator/
 │
 ├── CLAUDE.md               ← you are here
 │
-├── data.py                 ← pull + clean nfl_data_py data, compute PPR scores
+├── data.py                 ← pull + clean data, compute PPR scores, cache per-year parquet
 ├── fit.py                  ← estimate (α, β, π) per player via method of moments
-├── simulate.py             ← MC engine: draw from distributions, sum team scores
-├── matchup.py              ← takes two rosters → returns P(win), SE, score dist
+├── simulate.py             ← MC engine: vectorized zero-inflated Gamma draws
+├── matchup.py              ← two rosters → P(win), SE, score distributions
 │
 ├── data/
-│   ├── weekly_stats.parquet    ← cached raw pulls (avoid re-fetching)
-│   ├── player_params.parquet   ← fitted (α, β, π, μ, σ) per player-season
-│   └── schedules.parquet       ← 2026 schedule
+│   ├── weekly_stats_{year}.parquet  ← per-year cache (2022–2025)
+│   ├── player_params.parquet        ← fitted (α, β, π, μ, σ) per player
+│   └── schedules_{year}.parquet     ← schedule cache
 │
 └── notebooks/
-    └── exploration.ipynb   ← scratch space for parameter sanity checks
+    └── exploration.ipynb   ← parameter validation: Gamma fit, holdout calibration,
+                               simulation sanity check, matchup demo
 ```
 
 ---
@@ -122,37 +138,72 @@ nfl_mc_simulator/
 ## Module Contracts
 
 ### `data.py`
-- `pull_weekly_stats(years: list[int]) -> pd.DataFrame`
-  Returns tidy DataFrame with one row per player-week, columns include raw stat
-  fields and a computed `ppr_score` column.
-- `pull_rosters(year: int) -> pd.DataFrame`
-- `pull_schedule(year: int) -> pd.DataFrame`
+
+```python
+pull_weekly_stats(
+    years: list[int],
+    season_type: str = "REG",       # filter; "" = all game types
+    force_refresh: bool = False,
+) -> pd.DataFrame
+# One row per player-week. Columns: season, week, season_type, player_id,
+# player_name, position, recent_team, passing_yards, passing_tds,
+# interceptions, rushing_yards, rushing_tds, receiving_yards, receiving_tds,
+# receptions, rushing_fumbles_lost, receiving_fumbles_lost, sack_fumbles_lost,
+# passing_2pt_conversions, rushing_2pt_conversions, receiving_2pt_conversions,
+# fantasy_points_ppr, ppr_score.
+# Dispatches to nflreadpy for year > 2024; normalizes to same schema.
+
+pull_seasonal_rosters(year: int, force_refresh: bool = False) -> pd.DataFrame
+pull_schedule(year: int, game_type: str = "REG", force_refresh: bool = False) -> pd.DataFrame
+```
 
 ### `fit.py`
-- `fit_player_params(weekly_df: pd.DataFrame) -> pd.DataFrame`
-  Returns one row per player with columns: `player_id`, `player_name`, `alpha`,
-  `beta`, `pi`, `mu`, `sigma`, `n_games`.
-  Fitting is done on non-zero weeks only. Players with < 4 non-zero weeks get
-  flagged and fall back to positional median parameters.
+
+```python
+fit_player_params(
+    weekly_df: pd.DataFrame,
+    min_nonzero: int = 4,           # fallback threshold
+    cache: bool = True,             # writes data/player_params.parquet
+) -> pd.DataFrame
+# One row per player. Columns: player_id, player_name, position,
+# alpha, beta, pi, mu, sigma, n_games, n_nonzero, fallback_used.
+# Fitting on non-zero weeks only. Players with n_nonzero < 4 or σ = 0
+# fall back to positional-median parameters.
+# π excludes bye weeks: n_possible = 17 × n_seasons.
+```
 
 ### `simulate.py`
-- `simulate_team_score(roster: list[dict], player_params: pd.DataFrame, n: int) -> np.ndarray`
-  Returns array of shape `(n,)` — one total team score per trial.
-  Each player draw: `0` with prob `π`, else `Gamma(α, β)` sample.
+
+```python
+simulate_team_score(
+    roster: list[dict],             # each dict needs "player_id"; bye players must be pre-filtered
+    player_params: pd.DataFrame,
+    n: int = 10_000,
+    rng: int | np.random.Generator | None = None,
+) -> np.ndarray                     # shape (n,) — one total PPR score per trial
+```
 
 ### `matchup.py`
-- `simulate_matchup(roster_a, roster_b, player_params, n=10_000) -> dict`
-  Returns:
-  ```python
-  {
-      "p_win_a": float,       # P(Team A wins)
-      "se": float,            # standard error of estimate
-      "mean_score_a": float,
-      "mean_score_b": float,
-      "score_dist_a": np.ndarray,   # shape (n,)
-      "score_dist_b": np.ndarray,
-  }
-  ```
+
+```python
+simulate_matchup(
+    roster_a: list[dict],           # each dict needs "player_id" and "team" (if bye_teams used)
+    roster_b: list[dict],
+    player_params: pd.DataFrame,
+    n: int = 10_000,
+    bye_teams: list[str] | None = None,   # NFL team abbreviations on bye this week
+    rng: int | np.random.Generator | None = None,
+) -> dict
+# Returns:
+# {
+#     "p_win_a": float,             # P(Team A score > Team B score)
+#     "se": float,                  # sqrt(p̂(1-p̂)/n)
+#     "mean_score_a": float,
+#     "mean_score_b": float,
+#     "score_dist_a": np.ndarray,   # shape (n,)
+#     "score_dist_b": np.ndarray,
+# }
+```
 
 ---
 
@@ -162,17 +213,25 @@ nfl_mc_simulator/
   Gaussian would assign positive probability to negative scores.
 - **Zero-inflation handled explicitly**: DNP weeks are modeled as a Bernoulli
   draw on π rather than being included in the Gamma fit, which would bias α and β downward.
+- **π excludes bye weeks**: π is estimated as `(n_possible − n_nonzero) / n_possible`
+  where `n_possible = 17 × n_seasons`. `matchup.py` filters bye players before
+  simulation via the `bye_teams` parameter; passing a bye player into
+  `simulate_team_score` would give them a non-zero Gamma draw, inflating their score.
 - **Method of moments over MLE**: Closed-form, fast, and sufficient given
-  typical per-player sample sizes (16–34 games). MLE would give marginally
-  better estimates but adds complexity.
+  typical per-player sample sizes (16–51 games across 3 seasons). MLE would give
+  marginally better estimates but adds complexity.
+- **Per-year parquet cache**: Each season is cached separately so adding a new
+  year only fetches the delta rather than re-fetching everything.
 - **N = 10,000 default**: Gives SE < 0.005 for all p̂ ∈ (0.1, 0.9). Increase
-  to 50,000 only if you need tighter tails (e.g. playoff odds).
+  to 50,000 for tighter tail estimates (e.g. playoff bracket odds).
+- **PCG64 RNG**: Uses `np.random.default_rng()` (not legacy `np.random.*`).
+  Thread-safe and reproducible via integer seed.
 
 ---
 
 ## Not In Scope (Yet)
 
-- Player correlations / covariance structure (Phase 2)
+- Player correlations / covariance structure (Phase 2 — Gaussian copula)
 - Injury simulation / week-to-week availability modeling
 - Trade evaluation or waiver wire optimizer
 - Multi-week season simulation (playoff bracket odds)
@@ -207,6 +266,5 @@ building MC simulators. When writing or explaining code:
 - Use **type hints** throughout.
 - Prefer **pandas** for data wrangling, **numpy** for the simulation loop
   (avoid Python loops over players — vectorize where possible).
-- Cache all nfl_data_py pulls to `data/` as `.parquet` to avoid redundant
-  network calls.
+- Cache all data pulls to `data/` as per-year `.parquet` files.
 - No Jupyter magic in `.py` files — keep notebooks separate.
