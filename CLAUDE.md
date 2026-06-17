@@ -231,7 +231,24 @@ simulate_matchup(
 
 ## Not In Scope (Yet)
 
-- Player correlations / covariance structure (Phase 2 — Gaussian copula)
+### Phase 2 — Player correlations
+- Intra-team covariance structure via Gaussian copula (QB–WR stack effects)
+- Replace independent Gamma draws with correlated multivariate draw mapped back to Gamma marginals
+
+### Phase 3 — Game-level modeling
+nflreadpy provides data back to **1999** (27 seasons), which is too old to be useful for
+per-player parameter estimation (different rosters, different era) but is well-suited for
+**team/game-level models** where scoring distributions are more stable over time:
+
+- **Team total sanity check**: fit empirical team scoring distributions from historical games
+  and verify the bottom-up player simulator produces totals in the right range
+- **Defense adjustment**: the current model has no opponent context — a QB facing a top
+  defense vs. a bottom defense should have different expected output. Game-level data enables
+  positional scoring-suppression factors by opponent defensive tier.
+- **Scoring environment drift**: points per game have risen materially since 1999; pre-2015
+  data should be modeled with a temporal trend rather than pooled as i.i.d. with recent seasons.
+
+### Other future work
 - Injury simulation / week-to-week availability modeling
 - Trade evaluation or waiver wire optimizer
 - Multi-week season simulation (playoff bracket odds)
